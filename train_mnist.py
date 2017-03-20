@@ -9,6 +9,7 @@ import gzip
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import random
 import numpy as np
+from interface import Siamese
 from keras.layers import (
     Input,
     Conv2D,
@@ -48,15 +49,6 @@ def load_mnist():
     return (x_train, y_train), (x_valid, y_valid), (x_test, y_test)
 
 
-def contrastive_loss(y_true, y_pred):
-    '''Contrastive loss from Hadsell-et-al.'06
-    http://yann.lecun.com/exdb/publis/pdf/hadsell-chopra-lecun-06.pdf
-    '''
-    margin = 1
-    return K.mean(y_true * K.square(y_pred) +
-                  (1 - y_true) * K.square(K.maximum(margin - y_pred, 0)))
-
-
 def create_pairs(x, digit_indexes):
     pairs = []
     labels = []
@@ -94,32 +86,6 @@ def get_base_network(input_shape):
     return model
 
 
-def get_siamese(base_network, input_shape):
-    def euclidean_distance(vects):
-        x, y = vects
-        return K.sqrt(K.sum(K.square(x - y), axis=1, keepdims=True))
-
-    def eucl_dist_output_shape(shapes):
-        shape1, shape2 = shapes
-        return (shape1[0], 1)
-
-    input_a = Input(shape=input_shape)
-    input_b = Input(shape=input_shape)
-
-    # because we re-use the same instance `base_network`,
-    # the weights of the network
-    # will be shared across the two branches
-    processed_a = base_network(input_a)
-    processed_b = base_network(input_b)
-
-    distance = Lambda(euclidean_distance,
-                      output_shape=eucl_dist_output_shape)([processed_a, processed_b])
-
-    model = Model([input_a, input_b], distance)
-
-    return model
-
-
 def main():
     if K.image_dim_ordering() == 'th':
         input_shape = (channel, height, width)
@@ -135,46 +101,25 @@ def main():
     digit_indexes = [np.where(y_valid == i)[0] for i in range(10)]
     x_pairs_valid, is_matched_valid = create_pairs(x_valid, digit_indexes)
 
+    digit_indexes = [np.where(y_test == i)[0] for i in range(10)]
+    x_pairs_test, is_matched_test = create_pairs(x_test, digit_indexes)
+
     base_network = get_base_network(input_shape=input_shape)
-    siamese_network = get_siamese(base_network, input_shape)
+    siamese = Siamese(input_shape=input_shape,
+                      base_network=base_network)
+    rms = RMSprop()
+    siamese.compile(rms)
 
     # train
-    rms = RMSprop()
-    siamese_network.compile(loss=contrastive_loss, optimizer=rms, metrics=['accuracy'])
-    siamese_network.fit([x_pairs_train[:, 0], x_pairs_train[:, 1]], is_matched_train,
+    siamese.network.fit([x_pairs_train[:, 0], x_pairs_train[:, 1]], is_matched_train,
                         validation_data=([x_pairs_valid[:, 0], x_pairs_valid[:, 1]], is_matched_valid),
-                        batch_size=128, epochs=100)
+                        batch_size=300, epochs=5)
 
-    siamese_network.save_weights("siamese.hdf5")
+    siamese.network.save_weights("siamese.hdf5")
 
-    siamese_network.load_weights("siamese.hdf5")
+    acc_test = siamese.eval(x_pairs_test, is_matched_test)
 
-    def compute_accuracy(predictions, labels, thr):
-        '''Compute classification accuracy with a fixed threshold on distances.
-        '''
-        # pick labels predicted matched from labels
-        labels_matched = labels[predictions.ravel() < thr]
-
-        # pick labels predicted unmatched from labels
-        labels_unmatched = labels[predictions.ravel() > thr]
-
-        # create 0 / 1
-        labels_predicted = np.array([1] * len(labels_matched) + [0] * len(labels_unmatched))
-
-        # concatenate
-        _labels = np.concatenate((labels_matched, labels_unmatched), axis=0)
-
-        acc = len(_labels[_labels == labels_predicted]) / len(_labels)
-        return acc
-
-    # compute final accuracy on training and test sets
-    pred = siamese_network.predict([x_pairs_train[:, 0], x_pairs_train[:, 1]])
-    tr_acc = compute_accuracy(pred, is_matched_train, 0.5)
-    pred = siamese_network.predict([x_pairs_valid[:, 0], x_pairs_valid[:, 1]])
-    te_acc = compute_accuracy(pred, is_matched_valid, 0.5)
-
-    print('* Accuracy on training set: %0.2f%%' % (100 * tr_acc))
-    print('* Accuracy on test set: %0.2f%%' % (100 * te_acc))
+    print('* Accuracy on test set: %0.2f%%' % (100 * acc_test))
 
 
 if __name__ == "__main__":
